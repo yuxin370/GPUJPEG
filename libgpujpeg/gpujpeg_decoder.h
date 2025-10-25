@@ -309,6 +309,67 @@ gpujpeg_decoder_set_option(struct gpujpeg_decoder* decoder, const char *opt, con
 GPUJPEG_API void
 gpujpeg_decoder_print_options();
 
+/**
+ * Set quantized DCT coefficients from host memory into decoder internal device buffer.
+ * The decoder must be initialized for the target image (gpujpeg_decoder_init) so the
+ * internal buffers are allocated and `coder->data_size` is known.
+ *
+ * @param decoder Decoder instance
+ * @param host_coeffs Pointer to host int16_t array containing quantized coefficients
+ * @param coeff_count Number of int16_t coefficients (should equal coder->data_size)
+ * @return GPUJPEG_NOERR on success, GPUJPEG_ERROR on failure
+ */
+GPUJPEG_API int
+gpujpeg_decoder_set_quantized_coefficients_host(struct gpujpeg_decoder* decoder, const int16_t* host_coeffs, size_t coeff_count);
+
+/**
+ * Set quantized DCT coefficients from device memory into decoder internal device buffer.
+ * The pointer is expected to be a device pointer.
+ *
+ * @param decoder Decoder instance
+ * @param d_coeffs Device pointer to int16_t coefficients
+ * @param coeff_count Number of int16_t coefficients
+ * @return GPUJPEG_NOERR on success, GPUJPEG_ERROR on failure
+ */
+GPUJPEG_API int
+gpujpeg_decoder_set_quantized_coefficients_device(struct gpujpeg_decoder* decoder, const int16_t* d_coeffs, size_t coeff_count);
+
+/**
+ * Process the currently set quantized coefficients: performs dequantization + IDCT and
+ * postprocessing to produce raw RGB (or requested pixel format) into provided `output`.
+ * This reuses the internal IDCT and postprocessor implementations.
+ *
+ * @param decoder Decoder instance
+ * @param output Output descriptor - same as for gpujpeg_decoder_decode
+ * @return GPUJPEG_NOERR on success, error code otherwise
+ */
+GPUJPEG_API int
+gpujpeg_decoder_process_external_coefficients(struct gpujpeg_decoder* decoder, struct gpujpeg_decoder_output* output);
+
+/**
+ * Retrieve quantized DCT coefficients from decoder's internal device buffer into host memory.
+ * This copies `coeff_count` int16_t values from decoder internal buffer to the provided host
+ * pointer. Use this after decoder initialization / decoding to obtain coefficients extracted
+ * from the JPEG stream.
+ *
+ * @param decoder Decoder instance
+ * @param out_host_coeffs Pointer to host int16_t array where coefficients will be written
+ * @param coeff_count Number of int16_t coefficients (should equal coder->data_size)
+ * @return GPUJPEG_NOERR on success, GPUJPEG_ERROR on failure
+ */
+GPUJPEG_API int
+gpujpeg_decoder_get_quantized_coefficients_host(struct gpujpeg_decoder* decoder, int16_t* out_host_coeffs, size_t coeff_count);
+
+/**
+ * Returns number of quantized coefficients (int16_t) expected for the last initialized image.
+ * This value is valid after calling gpujpeg_decoder_init() for a specific image.
+ *
+ * @param decoder Decoder instance
+ * @return number of int16_t coefficients, or 0 if decoder not initialized
+ */
+GPUJPEG_API size_t
+gpujpeg_decoder_get_coefficients_count(struct gpujpeg_decoder* decoder);
+
 #ifdef __cplusplus
 }
 #endif

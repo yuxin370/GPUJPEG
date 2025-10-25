@@ -239,3 +239,10 @@ add_test(NAME test-colors COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/colors/run_tests.s
 add_test(NAME regression COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/regression/run_tests.sh ${CMAKE_CURRENT_BINARY_DIR}/${GPUJPEG_BIN_OUTPUT_NAME})
 
 # vim: sw=4
+
+
+# Build examples if desired
+option(BUILD_EXAMPLES "Build GPUJPEG examples" OFF)
+if(BUILD_EXAMPLES)
+    add_subdirectory(examples)
+endif()

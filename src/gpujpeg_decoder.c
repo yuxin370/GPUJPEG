@@ -575,4 +575,193 @@ gpujpeg_decoder_get_image_info2(uint8_t* image, size_t image_size, struct gpujpe
     return gpujpeg_reader_get_image_info(image, image_size, info, verbose, flags);
 }
 
+/* New API: set quantized coefficients from host memory into decoder's device buffer */
+GPUJPEG_API int
+gpujpeg_decoder_set_quantized_coefficients_host(struct gpujpeg_decoder* decoder, const int16_t* host_coeffs, size_t coeff_count)
+{
+    if (decoder == NULL || host_coeffs == NULL) {
+        return GPUJPEG_ERROR;
+    }
+    struct gpujpeg_coder* coder = &decoder->coder;
+    if (coder->data_size == 0 || coder->d_data_quantized == NULL) {
+        ERROR_MSG("Decoder is not initialized for image or quantized buffer missing!\n");
+        return GPUJPEG_ERROR;
+    }
+    if (coeff_count != coder->data_size) {
+        ERROR_MSG("Quantized coefficients count mismatch: expected %zu got %zu\n", coder->data_size, coeff_count);
+        return GPUJPEG_ERROR;
+    }
+
+    // Copy host coefficients to device buffer
+    cudaMemcpyAsync(coder->d_data_quantized, host_coeffs, coeff_count * sizeof(int16_t), cudaMemcpyHostToDevice, coder->stream);
+    gpujpeg_cuda_check_error("Copy quantized coefficients to device", return GPUJPEG_ERROR);
+
+    return GPUJPEG_NOERR;
+}
+
+/* New API: set quantized coefficients from device memory into decoder's internal device buffer */
+GPUJPEG_API int
+gpujpeg_decoder_set_quantized_coefficients_device(struct gpujpeg_decoder* decoder, const int16_t* d_coeffs, size_t coeff_count)
+{
+    if (decoder == NULL || d_coeffs == NULL) {
+        return GPUJPEG_ERROR;
+    }
+    struct gpujpeg_coder* coder = &decoder->coder;
+    if (coder->data_size == 0 || coder->d_data_quantized == NULL) {
+        ERROR_MSG("Decoder is not initialized for image or quantized buffer missing!\n");
+        return GPUJPEG_ERROR;
+    }
+    if (coeff_count != coder->data_size) {
+        ERROR_MSG("Quantized coefficients count mismatch: expected %zu got %zu\n", coder->data_size, coeff_count);
+        return GPUJPEG_ERROR;
+    }
+
+    // Device to device copy
+    cudaMemcpyAsync(coder->d_data_quantized, d_coeffs, coeff_count * sizeof(int16_t), cudaMemcpyDeviceToDevice, coder->stream);
+    gpujpeg_cuda_check_error("Copy quantized coefficients device->device", return GPUJPEG_ERROR);
+
+    return GPUJPEG_NOERR;
+}
+
+/* New API: process set coefficients (IDCT + postprocessing) to produce raw output */
+GPUJPEG_API int
+gpujpeg_decoder_process_external_coefficients(struct gpujpeg_decoder* decoder, struct gpujpeg_decoder_output* output)
+{
+    if (decoder == NULL || output == NULL) {
+        return GPUJPEG_ERROR;
+    }
+
+    struct gpujpeg_coder* coder = &decoder->coder;
+
+    if (coder->d_data_quantized == NULL) {
+        ERROR_MSG("Quantized device buffer not allocated. Have you initialized decoder for image?\n");
+        return GPUJPEG_ERROR;
+    }
+
+    // Perform IDCT + dequantization (GPU implementation)
+    if (0 != gpujpeg_idct_gpu(decoder)) {
+        ERROR_MSG("IDCT (GPU) failed\n");
+        return GPUJPEG_ERROR;
+    }
+
+    // Ensure raw buffers are allocated (same logic as gpujpeg_decoder_decode)
+    if ( coder->data_raw_size > coder->data_raw_allocated_size ) {
+        coder->data_raw_allocated_size = 0;
+
+        if ( coder->data_raw != NULL ) {
+            cudaFreeHost(coder->data_raw);
+        }
+        coder->data_raw = NULL;
+        cudaMallocHost((void**)&coder->data_raw, coder->data_raw_size * sizeof(uint8_t));
+        // (Re)allocate raw data in device memory
+        cudaFree(coder->d_data_raw_allocated);
+        coder->d_data_raw_allocated = NULL;
+        cudaMalloc((void**)&coder->d_data_raw_allocated, coder->data_raw_size * sizeof(uint8_t));
+
+        gpujpeg_cuda_check_error("Decoder raw data allocation", return GPUJPEG_ERROR);
+        coder->data_raw_allocated_size = coder->data_raw_size;
+    }
+
+    // Select CUDA output buffer
+    if (output->type == GPUJPEG_DECODER_OUTPUT_CUSTOM_CUDA_BUFFER) {
+        coder->d_data_raw = output->data;
+    }
+    else if (output->type == GPUJPEG_DECODER_OUTPUT_OPENGL_TEXTURE && output->texture->texture_callback_attach_opengl == NULL) {
+        size_t data_size = 0;
+        uint8_t* d_data = gpujpeg_opengl_texture_map(output->texture, &data_size);
+        assert(data_size == coder->data_raw_size);
+        coder->d_data_raw = d_data;
+    }
+    else {
+        // Use internal CUDA buffer as decoding destination
+        coder->d_data_raw = coder->d_data_raw_allocated;
+    }
+
+    // Run postprocessor to convert component planes to requested pixel format
+    int rc = gpujpeg_postprocessor_decode(&decoder->coder, coder->stream);
+    if (rc != GPUJPEG_NOERR) {
+        ERROR_MSG("Postprocessor failed\n");
+        return rc;
+    }
+
+    // Wait for async operations before copying from the device
+    cudaStreamSynchronize(coder->stream);
+
+    // Fill output structure (copy or set pointers depending on output type)
+    output->data_size = coder->data_raw_size * sizeof(uint8_t);
+    output->param_image = decoder->coder.param_image;
+    if (output->param_image.color_space == GPUJPEG_NONE) {
+        output->param_image.color_space = decoder->coder.param.color_space_internal;
+    }
+
+    if (output->type == GPUJPEG_DECODER_OUTPUT_INTERNAL_BUFFER) {
+        cudaMemcpy(coder->data_raw, coder->d_data_raw, coder->data_raw_size * sizeof(uint8_t), cudaMemcpyDeviceToHost);
+        gpujpeg_cuda_check_error("Copy decoded image to host", return GPUJPEG_ERROR);
+        output->data = coder->data_raw;
+    }
+    else if (output->type == GPUJPEG_DECODER_OUTPUT_CUSTOM_BUFFER) {
+        assert(output->data != NULL);
+        cudaMemcpy(output->data, coder->d_data_raw, coder->data_raw_size * sizeof(uint8_t), cudaMemcpyDeviceToHost);
+        gpujpeg_cuda_check_error("Copy decoded image to custom host buffer", return GPUJPEG_ERROR);
+    }
+    else if (output->type == GPUJPEG_DECODER_OUTPUT_OPENGL_TEXTURE) {
+        if (output->texture->texture_callback_attach_opengl != NULL) {
+            size_t data_size = 0;
+            uint8_t* d_data = gpujpeg_opengl_texture_map(output->texture, &data_size);
+            assert(data_size == coder->data_raw_size);
+            cudaMemcpy(d_data, coder->d_data_raw, coder->data_raw_size * sizeof(uint8_t), cudaMemcpyDeviceToDevice);
+            gpujpeg_cuda_check_error("Copy decoded image to OpenGL PBO", return GPUJPEG_ERROR);
+        }
+        gpujpeg_opengl_texture_unmap(output->texture);
+    }
+    else if (output->type == GPUJPEG_DECODER_OUTPUT_CUDA_BUFFER) {
+        output->data = coder->d_data_raw;
+    }
+    else if (output->type == GPUJPEG_DECODER_OUTPUT_CUSTOM_CUDA_BUFFER) {
+        output->data = coder->d_data_raw;
+    }
+    else {
+        assert(0);
+    }
+
+    output->metadata = &decoder->metadata;
+
+    return GPUJPEG_NOERR;
+}
+
+/* New API: get quantized coefficients from decoder internal device buffer into host memory */
+GPUJPEG_API int
+gpujpeg_decoder_get_quantized_coefficients_host(struct gpujpeg_decoder* decoder, int16_t* out_host_coeffs, size_t coeff_count)
+{
+    if (decoder == NULL || out_host_coeffs == NULL) {
+        return GPUJPEG_ERROR;
+    }
+    struct gpujpeg_coder* coder = &decoder->coder;
+    if (coder->data_size == 0 || coder->d_data_quantized == NULL) {
+        ERROR_MSG("Quantized coefficients buffer not available. Has decoder been initialized or decoded?\n");
+        return GPUJPEG_ERROR;
+    }
+    if (coeff_count != coder->data_size) {
+        ERROR_MSG("Quantized coefficients count mismatch: expected %zu got %zu\n", coder->data_size, coeff_count);
+        return GPUJPEG_ERROR;
+    }
+
+    // Copy device buffer to host
+    cudaMemcpyAsync(out_host_coeffs, coder->d_data_quantized, coeff_count * sizeof(int16_t), cudaMemcpyDeviceToHost, coder->stream);
+    gpujpeg_cuda_check_error("Copy quantized coefficients to host", return GPUJPEG_ERROR);
+    // Ensure copy finished
+    cudaStreamSynchronize(coder->stream);
+
+    return GPUJPEG_NOERR;
+}
+
+/* Return number of quantized coefficients for initialized image */
+GPUJPEG_API size_t
+gpujpeg_decoder_get_coefficients_count(struct gpujpeg_decoder* decoder)
+{
+    if (decoder == NULL) return 0;
+    struct gpujpeg_coder* coder = &decoder->coder;
+    return coder->data_size;
+}
+
 /* vi: set expandtab sw=4 : */
