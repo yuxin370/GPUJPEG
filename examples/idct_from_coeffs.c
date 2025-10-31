@@ -193,6 +193,23 @@ int main(int argc, char** argv)
     } else {
         printf("Dumped quantized coefficients extracted from JPEG to %s\n", dumped_coeffs_name);
     }
+    // Also dump metadata required to initialize a decoder: gpujpeg_parameters and gpujpeg_image_parameters
+    char dumped_meta_name[1024];
+    snprintf(dumped_meta_name, sizeof(dumped_meta_name), "%s.from_jpeg.meta.bin", out_file);
+    {
+        FILE* mf = fopen(dumped_meta_name, "wb");
+        if (mf) {
+            if (fwrite(&info.param, 1, sizeof(info.param), mf) != sizeof(info.param) ||
+                fwrite(&info.param_image, 1, sizeof(info.param_image), mf) != sizeof(info.param_image)) {
+                fprintf(stderr, "Failed to write dumped metadata to %s\n", dumped_meta_name);
+            } else {
+                printf("Dumped decoder metadata to %s\n", dumped_meta_name);
+            }
+            fclose(mf);
+        } else {
+            fprintf(stderr, "Failed to open metadata file %s for writing\n", dumped_meta_name);
+        }
+    }
 
     // Now, process those coefficients through external coefficients path and get image
     if (gpujpeg_decoder_set_quantized_coefficients_host(dec, coeffs_from_jpeg, coeff_count) != GPUJPEG_NOERR) {
@@ -243,10 +260,79 @@ int main(int argc, char** argv)
         // reuse coeffs buffer and fill from dumped file we just wrote
         memcpy(coeffs, coeffs_from_jpeg, coeff_count * sizeof(int16_t));
     }
-
     // Process coefficients read from disk (coeffs)
-    if (gpujpeg_decoder_set_quantized_coefficients_host(dec, coeffs, coeff_count) != GPUJPEG_NOERR) {
-        fprintf(stderr, "Failed to set quantized coefficients (from disk read)\n");
+    // Create a fresh decoder instance for Flow B - do not reuse `dec` from Flow A
+    struct gpujpeg_decoder* dec2 = gpujpeg_decoder_create(0);
+    if (!dec2) {
+        fprintf(stderr, "Failed to create decoder instance for Flow B\n");
+        free(coeffs_from_jpeg);
+        free(coeffs);
+        gpujpeg_decoder_destroy(dec);
+        free(jpeg_buf);
+        return 1;
+    }
+
+    // Read decoder init parameters from disk (prefer meta next to provided coeffs_file, else the dumped meta)
+    struct gpujpeg_parameters param_disk;
+    struct gpujpeg_image_parameters param_image_disk;
+    int have_meta = 0;
+    if (coeffs_file) {
+        char meta_path[1024];
+        snprintf(meta_path, sizeof(meta_path), "%s.meta.bin", coeffs_file);
+        size_t msz = 0;
+        uint8_t* mbuf = read_file(meta_path, &msz);
+        if (mbuf && msz >= sizeof(param_disk) + sizeof(param_image_disk)) {
+            memcpy(&param_disk, mbuf, sizeof(param_disk));
+            memcpy(&param_image_disk, mbuf + sizeof(param_disk), sizeof(param_image_disk));
+            have_meta = 1;
+        }
+        free(mbuf);
+    }
+    if (!have_meta) {
+        // try dumped_meta_name created by this program
+        size_t msz = 0;
+        uint8_t* mbuf = read_file(dumped_meta_name, &msz);
+        if (mbuf && msz >= sizeof(param_disk) + sizeof(param_image_disk)) {
+            memcpy(&param_disk, mbuf, sizeof(param_disk));
+            memcpy(&param_image_disk, mbuf + sizeof(param_disk), sizeof(param_image_disk));
+            have_meta = 1;
+        }
+        free(mbuf);
+    }
+    if (!have_meta) {
+        fprintf(stderr, "Missing decoder metadata for Flow B; expected %s or %s.meta.bin\n", dumped_meta_name, coeffs_file ? coeffs_file : "<coeffs path>");
+        gpujpeg_decoder_destroy(dec2);
+        free(coeffs_from_jpeg);
+        free(coeffs);
+        gpujpeg_decoder_destroy(dec);
+        free(jpeg_buf);
+        return 1;
+    }
+
+    if (gpujpeg_decoder_init(dec2, &param_disk, &param_image_disk) != 0) {
+        fprintf(stderr, "Failed to init decoder (Flow B) for image parameters from disk meta\n");
+        gpujpeg_decoder_destroy(dec2);
+        free(coeffs_from_jpeg);
+        free(coeffs);
+        gpujpeg_decoder_destroy(dec);
+        free(jpeg_buf);
+        return 1;
+    }
+
+    size_t coeff_count2 = gpujpeg_decoder_get_coefficients_count(dec2);
+    if (coeff_count2 != coeff_count) {
+        fprintf(stderr, "Coefficient count mismatch between decoders: %zu vs %zu\n", coeff_count2, coeff_count);
+        gpujpeg_decoder_destroy(dec2);
+        free(coeffs_from_jpeg);
+        free(coeffs);
+        gpujpeg_decoder_destroy(dec);
+        free(jpeg_buf);
+        return 1;
+    }
+
+    if (gpujpeg_decoder_set_quantized_coefficients_host(dec2, coeffs, coeff_count2) != GPUJPEG_NOERR) {
+        fprintf(stderr, "Failed to set quantized coefficients (from disk read) on Flow B decoder\n");
+        gpujpeg_decoder_destroy(dec2);
         free(coeffs_from_jpeg);
         free(coeffs);
         gpujpeg_decoder_destroy(dec);
@@ -258,8 +344,9 @@ int main(int argc, char** argv)
     gpujpeg_decoder_output_set_default(&out_from_disk);
     out_from_disk.type = GPUJPEG_DECODER_OUTPUT_INTERNAL_BUFFER;
 
-    if (gpujpeg_decoder_process_external_coefficients(dec, &out_from_disk) != GPUJPEG_NOERR) {
-        fprintf(stderr, "Processing coefficients (from disk) failed\n");
+    if (gpujpeg_decoder_process_external_coefficients(dec2, &out_from_disk) != GPUJPEG_NOERR) {
+        fprintf(stderr, "Processing coefficients (from disk) failed on Flow B decoder\n");
+        gpujpeg_decoder_destroy(dec2);
         free(coeffs_from_jpeg);
         free(coeffs);
         gpujpeg_decoder_destroy(dec);
@@ -287,6 +374,8 @@ int main(int argc, char** argv)
     }
 
     // cleanup aux buffer
+    // destroy Flow B decoder
+    gpujpeg_decoder_destroy(dec2);
     free(coeffs_from_jpeg);
     free(ref_image);
 
