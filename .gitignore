@@ -42,6 +42,7 @@ test-driver
 *.sdf
 *.suo
 *.user
+.vscode
 Debug
 Release
 
