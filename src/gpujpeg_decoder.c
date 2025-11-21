@@ -211,7 +211,20 @@ gpujpeg_decoder_init(struct gpujpeg_decoder* decoder, const struct gpujpeg_param
 
     // For now we can't reinitialize decoder, we can only do first initialization
     if ( coder->param_image.width != 0 || coder->param_image.height != 0 || coder->param.comp_count != 0 ) {
-        fprintf(stderr, "[GPUJPEG] [Info] Reinitializing decoder.\n");
+        // fprintf(stderr, "[GPUJPEG] [Info] Reinitializing decoder.\n");
+        // 2.1 先把旧的 image/coder 资源释放掉
+        if (gpujpeg_coder_deinit(coder) != 0) {
+            fprintf(stderr, "[GPUJPEG] [Error] Failed to deinit coder!\n");
+            return -1;
+        }
+
+        // 2.2 再重新 init 一次 coder（注意：这不会管 decoder 级别的
+        //      table_quantization / d_table_huffman / huffman_gpu_decoder）
+        if (gpujpeg_coder_init(coder) != 0) {
+            fprintf(stderr, "[GPUJPEG] [Error] Failed to re-init coder!\n");
+            return -1;
+        }
+
     }
 
     if (0 == gpujpeg_coder_init_image(coder, param, param_image, coder->stream)) {

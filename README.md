@@ -182,8 +182,16 @@ To build console application check [Requirements](#requirements) and go
 to `gpujpeg` directory (where [README.md](README.md) and [COPYING](COPYING)
 files are placed) and run `cmake` command:
 
-    cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=native -Bbuild .
+    cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=native -DBUILD_SHARED_LIBS=OFF -Bbuild .
     cmake --build build --config Release
+
+    cmake -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.6/bin/nvcc \
+        -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/gcc-13 \
+        -DCMAKE_CUDA_ARCHITECTURES=native \
+        -Bbuild .
+
+    rm -rf build
 
 In Linux, you can also use **autotools** to create a build recipe for
 the library and the application or a plain old _Makefile.bkp_. However,

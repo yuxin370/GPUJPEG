@@ -182,6 +182,10 @@ target_link_libraries(gpujpeg-bin gpujpeg)
 set(GPUJPEG_BIN_OUTPUT_NAME "gpujpegtool")
 set_target_properties(gpujpeg-bin PROPERTIES OUTPUT_NAME ${GPUJPEG_BIN_OUTPUT_NAME})
 
+target_compile_options(gpujpeg PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--default-stream per-thread>
+)
+
 install(TARGETS ${PROJECT_NAME} gpujpeg-bin
         EXPORT GPUJPEGTargets
         ARCHIVE DESTINATION lib
